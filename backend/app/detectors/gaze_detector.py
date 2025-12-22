@@ -9,7 +9,8 @@ Technology: MediaPipe Face Mesh + Perspective-n-Point (PnP) algorithm
 
 import asyncio
 import time
-from typing import Dict, Optional, Tuple
+from collections import deque
+from typing import Dict, Optional, Tuple, Deque
 
 import cv2
 import mediapipe as mp
@@ -64,9 +65,25 @@ class GazeDetector:
         self.idx_mouth_left = 61
         self.idx_mouth_right = 291
 
+        # Eye indices for bounding box calculation
+        # These cover the eye contour
+        self.left_eye_indices = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+        self.right_eye_indices = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+
         # Deviation tracking
         self.deviation_start_time: Optional[float] = None
         self.current_deviation_duration: float = 0.0
+        self.last_normal_time: Optional[float] = None  # Track when user last looked normal
+
+        # Head pose smoothing (moving average)
+        self.yaw_history: Deque[float] = deque(maxlen=settings.HEAD_POSE_SMOOTHING_WINDOW)
+        self.pitch_history: Deque[float] = deque(maxlen=settings.HEAD_POSE_SMOOTHING_WINDOW)
+        self.deviation_history: Deque[bool] = deque(maxlen=settings.HEAD_POSE_SMOOTHING_WINDOW)
+
+        # Bounding box smoothing (5-frame moving average for stability)
+        self.face_box_history: Deque[Tuple[float, float, float, float]] = deque(maxlen=settings.HEAD_POSE_SMOOTHING_WINDOW)
+        self.left_eye_history: Deque[Tuple[float, float, float, float]] = deque(maxlen=settings.HEAD_POSE_SMOOTHING_WINDOW)
+        self.right_eye_history: Deque[Tuple[float, float, float, float]] = deque(maxlen=settings.HEAD_POSE_SMOOTHING_WINDOW)
 
     async def detect(self, frame: np.ndarray) -> Dict:
         """
@@ -114,9 +131,10 @@ class GazeDetector:
 
         # No face detected
         if not results.multi_face_landmarks:
-            # Reset deviation tracking
+            # Reset deviation tracking completely
             self.deviation_start_time = None
             self.current_deviation_duration = 0.0
+            self.last_normal_time = None
 
             return {
                 "face_detected": False,
@@ -148,25 +166,59 @@ class GazeDetector:
         # Calculate head pose using PnP
         yaw, pitch, roll = self._calculate_head_pose(image_points, w, h)
 
-        # Check for attention deviation (two-tier system)
-        minor_deviation, screen_deviation = self._check_deviation(yaw, pitch)
+        # Add to history for smoothing
+        self.yaw_history.append(yaw)
+        self.pitch_history.append(pitch)
 
-        # Update deviation duration (only for screen deviation - HIGH alert)
-        self._update_deviation_duration(screen_deviation)
+        # Calculate smoothed angles (moving average)
+        smoothed_yaw = np.mean(list(self.yaw_history))
+        smoothed_pitch = np.mean(list(self.pitch_history))
+
+        # Check for attention deviation using smoothed angles
+        minor_deviation, screen_deviation = self._check_deviation(smoothed_yaw, smoothed_pitch)
+
+        # Track deviation consistency
+        self.deviation_history.append(screen_deviation)
+
+        # Only consider it a real deviation if it's consistent across the window
+        deviation_consistency = sum(self.deviation_history) / len(self.deviation_history) if self.deviation_history else 0
+        is_sustained_deviation = deviation_consistency >= settings.DEVIATION_CONSISTENCY_THRESHOLD
+
+        # Update deviation duration with grace period logic
+        self._update_deviation_duration_with_grace(is_sustained_deviation)
+
+        # Get bounding boxes (raw)
+        face_box_raw = self._get_face_bounding_box(face_landmarks)
+        left_eye_box_raw = self._get_eye_bounding_box(face_landmarks, is_left=True)
+        right_eye_box_raw = self._get_eye_bounding_box(face_landmarks, is_left=False)
+
+        # Update history
+        self.face_box_history.append(face_box_raw)
+        self.left_eye_history.append(left_eye_box_raw)
+        self.right_eye_history.append(right_eye_box_raw)
+
+        # Calculate smoothed bounding boxes
+        face_box = self._calculate_average_box(self.face_box_history)
+        left_eye_box = self._calculate_average_box(self.left_eye_history)
+        right_eye_box = self._calculate_average_box(self.right_eye_history)
 
         # Calculate confidence (placeholder - can be improved)
         confidence = 0.85
 
         return {
             "face_detected": True,
-            "yaw": float(yaw),
-            "pitch": float(pitch),
+            "yaw": float(smoothed_yaw),  # Use smoothed values
+            "pitch": float(smoothed_pitch),
             "roll": float(roll),
-            "deviation": screen_deviation,  # Only report screen deviation for HIGH alerts
+            "deviation": is_sustained_deviation,  # Only report sustained deviations
             "minor_deviation": minor_deviation,  # Track minor deviation (no alert)
             "deviation_duration": self.current_deviation_duration,
+            "deviation_consistency": float(deviation_consistency),  # How consistent is the violation
             "confidence": confidence,
             "landmarks_count": len(image_points),
+            "face_box": face_box,
+            "left_eye": left_eye_box,
+            "right_eye": right_eye_box,
         }
 
     def _calculate_head_pose(
@@ -252,12 +304,15 @@ class GazeDetector:
 
         return minor_deviation, screen_deviation
 
-    def _update_deviation_duration(self, is_deviation: bool) -> None:
+    def _update_deviation_duration_with_grace(self, is_deviation: bool) -> None:
         """
-        Update the deviation duration timer.
+        Update the deviation duration timer with grace period.
+
+        The grace period prevents the system from resetting immediately when the user
+        briefly looks back at the screen, reducing false negatives and alert cycling.
 
         Args:
-            is_deviation: Whether current frame shows deviation
+            is_deviation: Whether current frame shows sustained deviation
         """
         current_time = time.time()
 
@@ -266,17 +321,117 @@ class GazeDetector:
             if self.deviation_start_time is None:
                 self.deviation_start_time = current_time
 
+            # Clear the "last normal" timestamp since we're deviating again
+            self.last_normal_time = None
+
             # Calculate elapsed time
             self.current_deviation_duration = current_time - self.deviation_start_time
         else:
-            # Reset tracking when attention returns
-            self.deviation_start_time = None
-            self.current_deviation_duration = 0.0
+            # User is looking at screen normally
+
+            # If we were tracking a deviation, start grace period
+            if self.deviation_start_time is not None:
+                # Mark when they started looking normal
+                if self.last_normal_time is None:
+                    self.last_normal_time = current_time
+
+                # Check if grace period has elapsed
+                time_since_normal = current_time - self.last_normal_time
+
+                if time_since_normal >= settings.DEVIATION_GRACE_PERIOD:
+                    # Grace period elapsed - fully reset
+                    self.deviation_start_time = None
+                    self.current_deviation_duration = 0.0
+                    self.last_normal_time = None
+                # else: Keep the deviation counter running during grace period
+            else:
+                # No active deviation, keep everything reset
+                self.current_deviation_duration = 0.0
+                self.last_normal_time = None
 
     def reset(self) -> None:
-        """Reset the deviation tracking state."""
+        """Reset the deviation tracking state and smoothing buffers."""
         self.deviation_start_time = None
         self.current_deviation_duration = 0.0
+        self.last_normal_time = None
+        self.yaw_history.clear()
+        self.pitch_history.clear()
+        self.deviation_history.clear()
+        self.face_box_history.clear()
+        self.left_eye_history.clear()
+        self.right_eye_history.clear()
+
+
+
+    def _get_face_bounding_box(self, landmarks) -> Tuple[float, float, float, float]:
+        """
+        Calculate the bounding box of the face.
+
+        Args:
+            landmarks: MediaPipe normalized landmarks
+
+        Returns:
+            Tuple of (x, y, w, h) normalized coordinates
+        """
+        x_min = min([lm.x for lm in landmarks])
+        y_min = min([lm.y for lm in landmarks])
+        x_max = max([lm.x for lm in landmarks])
+        y_max = max([lm.y for lm in landmarks])
+
+        return x_min, y_min, x_max - x_min, y_max - y_min
+
+    def _get_eye_bounding_box(self, landmarks, is_left: bool) -> Tuple[float, float, float, float]:
+        """
+        Calculate the bounding box of an eye.
+
+        Args:
+            landmarks: MediaPipe normalized landmarks
+            is_left: True for left eye, False for right eye
+
+        Returns:
+            Tuple of (x, y, w, h) normalized coordinates
+        """
+        indices = self.left_eye_indices if is_left else self.right_eye_indices
+        eye_landmarks = [landmarks[i] for i in indices]
+
+        x_min = min([lm.x for lm in eye_landmarks])
+        y_min = min([lm.y for lm in eye_landmarks])
+        x_max = max([lm.x for lm in eye_landmarks])
+        y_max = max([lm.y for lm in eye_landmarks])
+
+        # Add some padding
+        padding_x = (x_max - x_min) * 0.2
+        padding_y = (y_max - y_min) * 0.2
+
+        return (
+            max(0.0, x_min - padding_x),
+            max(0.0, y_min - padding_y),
+            (x_max - x_min) + 2 * padding_x,
+            (y_max - y_min) + 2 * padding_y
+        )
+
+    def _calculate_average_box(
+        self, history: Deque[Tuple[float, float, float, float]]
+    ) -> Tuple[float, float, float, float]:
+        """
+        Calculate the average bounding box from history.
+
+        Args:
+            history: Deque of (x, y, w, h) tuples
+
+        Returns:
+            Averaged (x, y, w, h) tuple
+        """
+        if not history:
+            return 0.0, 0.0, 0.0, 0.0
+
+        n = len(history)
+        avg_x = sum(box[0] for box in history) / n
+        avg_y = sum(box[1] for box in history) / n
+        avg_w = sum(box[2] for box in history) / n
+        avg_h = sum(box[3] for box in history) / n
+
+        return avg_x, avg_y, avg_w, avg_h
 
     def __del__(self):
         """Cleanup resources."""

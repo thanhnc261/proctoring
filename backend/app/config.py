@@ -46,6 +46,11 @@ class Settings:
     GAZE_EXTENDED_DURATION: float = 10.0   # seconds for extended violation (higher weight)
     GAZE_CRITICAL_DURATION: float = 20.0   # seconds for critical violation (highest weight)
 
+    # Smoothing and grace period settings
+    HEAD_POSE_SMOOTHING_WINDOW: int = 5    # frames to average for smoothing (reduce false positives)
+    DEVIATION_GRACE_PERIOD: float = 1.5    # seconds to wait before resetting (prevent rapid cycling)
+    DEVIATION_CONSISTENCY_THRESHOLD: float = 0.6  # 60% of frames must violate within window
+
     # Object detection
     YOLO_MODEL_PATH: str = "models/yolov8m.pt"  # Medium model for better detection
     YOLO_CONFIDENCE: float = 0.25  # Higher confidence for yolov8m

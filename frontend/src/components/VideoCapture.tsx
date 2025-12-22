@@ -12,6 +12,7 @@ import {
   FrameRateCalculator,
 } from '../utils/videoUtils';
 import type { WebSocketClient } from '../services/websocket';
+import { useProctoringStore } from '../stores/proctoringStore';
 
 interface VideoCaptureProps {
   wsClient: WebSocketClient | null;
@@ -33,6 +34,7 @@ export function VideoCapture({
   const [isReady, setIsReady] = useState(false);
   const [currentFPS, setCurrentFPS] = useState(0);
   const [framesSent, setFramesSent] = useState(0);
+  const [videoResolution, setVideoResolution] = useState({ width: 0, height: 0 });
 
   // Initialize camera
   useEffect(() => {
@@ -53,6 +55,15 @@ export function VideoCapture({
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           setIsReady(true);
+          // Update resolution once video metadata loads
+          videoRef.current.onloadedmetadata = () => {
+            if (videoRef.current) {
+              setVideoResolution({
+                width: videoRef.current.videoWidth,
+                height: videoRef.current.videoHeight
+              });
+            }
+          };
         }
       } catch (error) {
         console.error('❌ Failed to access camera:', error);
@@ -136,8 +147,177 @@ export function VideoCapture({
       setFramesSent(0);
       setCurrentFPS(0);
       fpsCalculator.current.reset();
+      // Reset smoothed boxes
+      smoothedFaceBox.current = null;
+      smoothedLeftEye.current = null;
+      smoothedRightEye.current = null;
     }
   }, [isActive]);
+
+  // Get latest analysis from store
+  const latestAnalysis = useProctoringStore((state) => state.latestAnalysis);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animationFrameRef = useRef<number | null>(null);
+
+  // Smooth bounding box interpolation (adaptive movement - slower than actual face/eye)
+  const smoothedFaceBox = useRef<[number, number, number, number] | null>(null);
+  const smoothedLeftEye = useRef<[number, number, number, number] | null>(null);
+  const smoothedRightEye = useRef<[number, number, number, number] | null>(null);
+
+  // Draw detection overlay with requestAnimationFrame throttling
+  useEffect(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+
+    console.log('🎨 VideoCapture overlay effect triggered:', {
+      hasVideo: !!video,
+      hasCanvas: !!canvas,
+      hasAnalysis: !!latestAnalysis,
+      face_detected: latestAnalysis?.gaze?.face_detected,
+      face_box: latestAnalysis?.gaze?.face_box,
+    });
+
+    if (!video || !canvas || !latestAnalysis) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Cancel previous animation frame if it exists
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
+
+    // Helper to smoothly interpolate bounding boxes (70% old + 30% new = faster tracking)
+    // If movement is too large (>15% of frame), render new position directly
+    const smoothBox = (
+      current: [number, number, number, number] | null,
+      target: [number, number, number, number]
+    ): [number, number, number, number] => {
+      if (!current) return target;
+
+      // Calculate distance moved (normalized)
+      const dx = Math.abs(target[0] - current[0]);
+      const dy = Math.abs(target[1] - current[1]);
+      const maxMovement = Math.max(dx, dy);
+
+      // If movement is too large (quick head turn), jump to new position
+      if (maxMovement > 0.15) {
+        return target;
+      }
+
+      // Otherwise, smooth interpolation for natural movement
+      return [
+        current[0] * 0.7 + target[0] * 0.3, // x - faster tracking
+        current[1] * 0.7 + target[1] * 0.3, // y - faster tracking
+        current[2] * 0.7 + target[2] * 0.3, // w - faster resizing
+        current[3] * 0.7 + target[3] * 0.3, // h - faster resizing
+      ];
+    };
+
+    // Use requestAnimationFrame for smooth rendering (throttles to ~60fps max)
+    animationFrameRef.current = requestAnimationFrame(() => {
+      // Match canvas resolution to video
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+
+      // Clear canvas
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const { gaze } = latestAnalysis;
+      if (!gaze.face_detected) return;
+
+      // Apply smooth interpolation to bounding boxes for adaptive movement
+      if (gaze.face_box) {
+        smoothedFaceBox.current = smoothBox(smoothedFaceBox.current, gaze.face_box);
+      }
+      if (gaze.left_eye) {
+        smoothedLeftEye.current = smoothBox(smoothedLeftEye.current, gaze.left_eye);
+      }
+      if (gaze.right_eye) {
+        smoothedRightEye.current = smoothBox(smoothedRightEye.current, gaze.right_eye);
+      }
+
+      // Helper to draw bounding box with corners (thin borders)
+      const drawBox = (box: [number, number, number, number], color: string, lineWidth: number = 2) => {
+        const [x, y, w, h] = box;
+        const px = x * canvas.width;
+        const py = y * canvas.height;
+        const pw = w * canvas.width;
+        const ph = h * canvas.height;
+
+        // Main rectangle with glow (thin border)
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 8;
+        ctx.strokeRect(px, py, pw, ph);
+
+        // Corner markers (no glow, thin)
+        ctx.shadowColor = 'transparent';
+        ctx.shadowBlur = 0;
+        ctx.lineWidth = lineWidth;
+        const cornerLen = Math.min(pw, ph) * 0.2;
+
+        ctx.beginPath(); ctx.moveTo(px, py + cornerLen); ctx.lineTo(px, py); ctx.lineTo(px + cornerLen, py); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(px + pw - cornerLen, py); ctx.lineTo(px + pw, py); ctx.lineTo(px + pw, py + cornerLen); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(px + pw, py + ph - cornerLen); ctx.lineTo(px + pw, py + ph); ctx.lineTo(px + pw - cornerLen, py + ph); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(px + cornerLen, py + ph); ctx.lineTo(px, py + ph); ctx.lineTo(px, py + ph - cornerLen); ctx.stroke();
+      };
+
+      // Helper to draw ellipse for eyes (smooth oval shape)
+      const drawEllipse = (box: [number, number, number, number], color: string, lineWidth: number = 2) => {
+        const [x, y, w, h] = box;
+        const px = x * canvas.width;
+        const py = y * canvas.height;
+        const pw = w * canvas.width;
+        const ph = h * canvas.height;
+
+        // Calculate center and radii
+        const centerX = px + pw / 2;
+        const centerY = py + ph / 2;
+        const radiusX = pw / 2;
+        const radiusY = ph / 2;
+
+        // Draw ellipse with glow
+        ctx.beginPath();
+        ctx.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, 2 * Math.PI);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 6;
+        ctx.stroke();
+
+        // Reset shadow
+        ctx.shadowColor = 'transparent';
+        ctx.shadowBlur = 0;
+      };
+
+      // Draw face box (smoothed, thin border)
+      if (smoothedFaceBox.current) {
+        const color = gaze.deviation ? '#f43f5e' : '#10b981';
+        drawBox(smoothedFaceBox.current, color, 2.5); // Thin: 2.5px
+
+        // Label
+        const [x, y] = smoothedFaceBox.current;
+        ctx.fillStyle = color;
+        ctx.font = 'bold 14px monospace';
+        ctx.shadowBlur = 0;
+        ctx.fillText(gaze.deviation ? '⚠ ALERT' : 'NORMAL', x * canvas.width, y * canvas.height - 10);
+      }
+
+      // Draw eye ellipses (smoothed, thin border)
+      if (smoothedLeftEye.current) drawEllipse(smoothedLeftEye.current, '#3b82f6', 2); // Thin: 2px
+      if (smoothedRightEye.current) drawEllipse(smoothedRightEye.current, '#3b82f6', 2); // Thin: 2px
+    });
+
+    return () => {
+      if (animationFrameRef.current !== null) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [latestAnalysis, isActive]);
 
   if (cameraError) {
     return (
@@ -199,6 +379,12 @@ export function VideoCapture({
           onLoadedMetadata={() => setIsReady(true)}
         />
 
+        {/* Detection Overlay Canvas */}
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 z-20 pointer-events-none w-full h-full"
+        />
+
         {/* Overlay Grid (Cyberpunk-ish) */}
         <div className="absolute inset-0 z-20 pointer-events-none opacity-20 bg-[linear-gradient(rgba(255,255,255,0.05)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.05)_1px,transparent_1px)] bg-[size:50px_50px]" />
 
@@ -212,7 +398,7 @@ export function VideoCapture({
           <div className="bg-black/60 backdrop-blur-md rounded-lg p-2 text-white/90 text-xs font-mono space-y-1">
             <div className="flex items-center gap-2">
               <span className="text-white/50">RES:</span>
-              <span>{videoRef.current?.videoWidth}x{videoRef.current?.videoHeight}</span>
+              <span>{videoResolution.width}x{videoResolution.height}</span>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-white/50">FPS:</span>

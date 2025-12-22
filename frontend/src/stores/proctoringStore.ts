@@ -94,11 +94,27 @@ export const useProctoringStore = create<ProctoringState>((set) => ({
 
   // Update with new analysis results
   updateAnalysis: (analysis: AnalysisResults) => {
+    console.log('🔄 Store updateAnalysis called:', {
+      face_detected: analysis.gaze?.face_detected,
+      person_count: analysis.objects?.person_count,
+      risk_score: analysis.risk?.risk_score,
+      summary: analysis.behavior?.analysis_summary,
+    });
+
+    // IGNORE skipped frames (backend optimization for low motion)
+    if (analysis.behavior?.analysis_summary?.includes('Frame skipped')) {
+      console.log('⏭️  Skipping analysis update for low-motion frame');
+      return; // Don't update state with empty data
+    }
+
     set((state) => {
       const newFrameCount = state.frameCount + 1;
       const currentSession = state.session;
 
-      if (!currentSession) return state;
+      if (!currentSession) {
+        console.warn('⚠️ No active session, skipping analysis update');
+        return state;
+      }
 
       // Update session with new data
       const updatedSession: ProctoringSession = {
@@ -147,7 +163,7 @@ export const useProctoringStore = create<ProctoringState>((set) => ({
         updatedSession.alerts = newAlerts;
       }
 
-      return {
+      const newState = {
         session: updatedSession,
         latestAnalysis: analysis,
         analysisHistory: newHistory,
@@ -156,6 +172,15 @@ export const useProctoringStore = create<ProctoringState>((set) => ({
         alerts: newAlerts,
         unacknowledgedAlerts: newUnacknowledged,
       };
+
+      console.log('✅ Store updated successfully:', {
+        frameCount: newFrameCount,
+        latestAnalysis: newState.latestAnalysis ? 'Updated' : 'Null',
+        face_detected: newState.latestAnalysis?.gaze?.face_detected,
+        person_count: newState.latestAnalysis?.objects?.person_count,
+      });
+
+      return newState;
     });
   },
 

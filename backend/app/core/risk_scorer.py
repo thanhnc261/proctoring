@@ -103,22 +103,41 @@ class RiskScorer:
         violations = []
         violation_count = 0
 
-        # Score gaze deviation (time-based weighting for screen deviation)
+        # Score gaze deviation (progressive severity based on duration and consistency)
         if gaze_results.get("deviation", False):
             deviation_duration = gaze_results.get("deviation_duration", 0.0)
+            deviation_consistency = gaze_results.get("deviation_consistency", 0.0)
 
             # Only alert if duration exceeds minimum threshold
             if deviation_duration >= settings.GAZE_DEVIATION_DURATION:
-                # Apply time-based weighting
+                # Progressive weight calculation (increases gradually with time)
+                # Use interpolation between thresholds for smooth progression
                 if deviation_duration >= settings.GAZE_CRITICAL_DURATION:  # 20+ seconds
+                    # Beyond critical: max weight
                     screen_weight = self.screen_deviation_critical_weight
                     duration_label = f"for {deviation_duration:.1f}s (CRITICAL)"
                 elif deviation_duration >= settings.GAZE_EXTENDED_DURATION:  # 10-20 seconds
-                    screen_weight = self.screen_deviation_extended_weight
+                    # Interpolate between extended and critical
+                    progress = (deviation_duration - settings.GAZE_EXTENDED_DURATION) / (
+                        settings.GAZE_CRITICAL_DURATION - settings.GAZE_EXTENDED_DURATION
+                    )
+                    screen_weight = self.screen_deviation_extended_weight + (
+                        self.screen_deviation_critical_weight - self.screen_deviation_extended_weight
+                    ) * progress
                     duration_label = f"for {deviation_duration:.1f}s (extended)"
                 else:  # 3-10 seconds (base threshold)
-                    screen_weight = self.screen_deviation_base_weight
+                    # Interpolate between base and extended
+                    progress = (deviation_duration - settings.GAZE_DEVIATION_DURATION) / (
+                        settings.GAZE_EXTENDED_DURATION - settings.GAZE_DEVIATION_DURATION
+                    )
+                    screen_weight = self.screen_deviation_base_weight + (
+                        self.screen_deviation_extended_weight - self.screen_deviation_base_weight
+                    ) * progress
                     duration_label = f"for {deviation_duration:.1f}s"
+
+                # Apply consistency factor (reduce weight if not highly consistent)
+                # This prevents alerts from being too severe for intermittent violations
+                screen_weight *= deviation_consistency
 
                 base_score += screen_weight
                 violations.append(f"Looking at another screen {duration_label}")
@@ -161,24 +180,39 @@ class RiskScorer:
             final_score, violations, behavior_results
         )
 
-        # Calculate screen deviation contribution with time-based weight
+        # Calculate screen deviation contribution with progressive weight
         screen_contribution = 0
         if gaze_results.get("deviation", False):
             deviation_duration = gaze_results.get("deviation_duration", 0.0)
+            deviation_consistency = gaze_results.get("deviation_consistency", 0.0)
             # Only count contribution if duration exceeds minimum threshold
             if deviation_duration >= settings.GAZE_DEVIATION_DURATION:
+                # Use same progressive calculation as above
                 if deviation_duration >= settings.GAZE_CRITICAL_DURATION:
                     screen_contribution = self.screen_deviation_critical_weight
                 elif deviation_duration >= settings.GAZE_EXTENDED_DURATION:
-                    screen_contribution = self.screen_deviation_extended_weight
+                    progress = (deviation_duration - settings.GAZE_EXTENDED_DURATION) / (
+                        settings.GAZE_CRITICAL_DURATION - settings.GAZE_EXTENDED_DURATION
+                    )
+                    screen_contribution = self.screen_deviation_extended_weight + (
+                        self.screen_deviation_critical_weight - self.screen_deviation_extended_weight
+                    ) * progress
                 else:
-                    screen_contribution = self.screen_deviation_base_weight
+                    progress = (deviation_duration - settings.GAZE_DEVIATION_DURATION) / (
+                        settings.GAZE_EXTENDED_DURATION - settings.GAZE_DEVIATION_DURATION
+                    )
+                    screen_contribution = self.screen_deviation_base_weight + (
+                        self.screen_deviation_extended_weight - self.screen_deviation_base_weight
+                    ) * progress
+                # Apply consistency factor
+                screen_contribution *= deviation_consistency
 
         # Create detailed breakdown
         details = {
             "base_score": float(base_score),
-            "screen_deviation_contribution": screen_contribution,
+            "screen_deviation_contribution": float(screen_contribution),
             "screen_deviation_duration": gaze_results.get("deviation_duration", 0.0),
+            "screen_deviation_consistency": gaze_results.get("deviation_consistency", 0.0),
             "object_contribution": sum(
                 self.forbidden_object_weight * item.get("confidence", 1.0)
                 for item in forbidden_items

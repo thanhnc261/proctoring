@@ -4,13 +4,43 @@
  * Displays real-time statistics and metrics from the proctoring session
  */
 
-import { useMemo } from 'react';
+import { useMemo, useState, useEffect, useRef } from 'react';
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { useProctoringStore } from '../stores/proctoringStore';
 
 export function StatsDashboard() {
   const { session, latestAnalysis, analysisHistory, avgProcessingTime } =
     useProctoringStore();
+
+  // Smooth value interpolation for stats display (reduces flickering)
+  const [displayYaw, setDisplayYaw] = useState(0);
+  const [displayPitch, setDisplayPitch] = useState(0);
+  const lastUpdateRef = useRef(0);
+
+  // Throttle updates to every 200ms (5 updates per second max)
+  useEffect(() => {
+    if (!latestAnalysis) {
+      console.log('📊 StatsDashboard: No analysis data');
+      return;
+    }
+
+    console.log('📊 StatsDashboard received analysis:', {
+      face_detected: latestAnalysis.gaze?.face_detected,
+      yaw: latestAnalysis.gaze?.yaw,
+      pitch: latestAnalysis.gaze?.pitch,
+      person_count: latestAnalysis.objects?.person_count,
+      pattern_score: latestAnalysis.behavior?.pattern_score,
+    });
+
+    const now = Date.now();
+    if (now - lastUpdateRef.current < 200) return; // Throttle
+
+    lastUpdateRef.current = now;
+
+    // Smooth interpolation (30% new value, 70% old value)
+    setDisplayYaw((prev) => prev * 0.7 + latestAnalysis.gaze.yaw * 0.3);
+    setDisplayPitch((prev) => prev * 0.7 + latestAnalysis.gaze.pitch * 0.3);
+  }, [latestAnalysis]);
 
   // Prepare chart data from history
   const riskScoreHistory = useMemo(() => {
@@ -161,24 +191,24 @@ export function StatsDashboard() {
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between items-center p-2 rounded-lg bg-slate-50">
                   <span className="text-slate-600">Face</span>
-                  <span className={`font-bold px-2 py-0.5 rounded text-xs ${latestAnalysis.gaze.face_detected ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
-                    {latestAnalysis.gaze.face_detected ? 'DETECTED' : 'MISSING'}
+                  <span className={`font-bold px-2 py-0.5 rounded text-xs ${latestAnalysis.gaze?.face_detected ?? false ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
+                    {latestAnalysis.gaze?.face_detected ?? false ? 'DETECTED' : 'MISSING'}
                   </span>
                 </div>
                 <div className="flex justify-between items-center p-2 rounded-lg bg-slate-50">
                   <span className="text-slate-600">Focus</span>
-                  <span className={`font-bold px-2 py-0.5 rounded text-xs ${latestAnalysis.gaze.deviation ? 'bg-rose-100 text-rose-700' : 'bg-emerald-100 text-emerald-700'}`}>
-                    {latestAnalysis.gaze.deviation ? 'DISTRACTED' : 'FOCUSED'}
+                  <span className={`font-bold px-2 py-0.5 rounded text-xs ${latestAnalysis.gaze?.deviation ?? false ? 'bg-rose-100 text-rose-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                    {latestAnalysis.gaze?.deviation ?? false ? 'DISTRACTED' : 'FOCUSED'}
                   </span>
                 </div>
                 <div className="grid grid-cols-2 gap-2 mt-2">
                   <div className="text-center p-2 bg-slate-50 rounded-lg">
                     <div className="text-[10px] text-slate-400 uppercase">Yaw</div>
-                    <div className="font-mono font-semibold">{latestAnalysis.gaze.yaw.toFixed(1)}°</div>
+                    <div className="font-mono font-semibold transition-all duration-200">{displayYaw.toFixed(1)}°</div>
                   </div>
                   <div className="text-center p-2 bg-slate-50 rounded-lg">
                     <div className="text-[10px] text-slate-400 uppercase">Pitch</div>
-                    <div className="font-mono font-semibold">{latestAnalysis.gaze.pitch.toFixed(1)}°</div>
+                    <div className="font-mono font-semibold transition-all duration-200">{displayPitch.toFixed(1)}°</div>
                   </div>
                 </div>
               </div>
@@ -193,14 +223,14 @@ export function StatsDashboard() {
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between items-center p-2 rounded-lg bg-slate-50">
                   <span className="text-slate-600">Persons</span>
-                  <span className={`font-bold px-2 py-0.5 rounded text-xs ${latestAnalysis.objects.person_count > 1 ? 'bg-rose-100 text-rose-700' : 'bg-slate-200 text-slate-700'}`}>
-                    {latestAnalysis.objects.person_count}
+                  <span className={`font-bold px-2 py-0.5 rounded text-xs ${(latestAnalysis.objects?.person_count ?? 0) > 1 ? 'bg-rose-100 text-rose-700' : 'bg-slate-200 text-slate-700'}`}>
+                    {latestAnalysis.objects?.person_count ?? 0}
                   </span>
                 </div>
                 <div className="flex justify-between items-start p-2 rounded-lg bg-slate-50 min-h-[60px]">
                   <span className="text-slate-600">Forbidden</span>
                   <div className="text-right">
-                    {latestAnalysis.objects.forbidden_items.length > 0 ? (
+                    {(latestAnalysis.objects?.forbidden_items?.length ?? 0) > 0 ? (
                       <div className="flex flex-col gap-1 items-end">
                         {latestAnalysis.objects.forbidden_items.map((item, idx) => (
                           <span key={idx} className="text-xs font-bold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-100">
@@ -226,18 +256,18 @@ export function StatsDashboard() {
                 <div className="p-3 rounded-lg bg-slate-50 mb-2">
                   <div className="flex justify-between text-xs mb-1">
                     <span className="text-slate-500">Pattern Suspicion Score</span>
-                    <span className="font-bold text-slate-900">{latestAnalysis.behavior.pattern_score.toFixed(0)}/100</span>
+                    <span className="font-bold text-slate-900">{(latestAnalysis.behavior?.pattern_score ?? 0).toFixed(0)}/100</span>
                   </div>
                   <div className="w-full bg-slate-200 h-1.5 rounded-full overflow-hidden">
                     <div
-                      className={`h-full rounded-full ${latestAnalysis.behavior.pattern_score > 50 ? 'bg-rose-500' : 'bg-emerald-500'}`}
-                      style={{ width: `${Math.min(latestAnalysis.behavior.pattern_score, 100)}%` }}
+                      className={`h-full rounded-full ${(latestAnalysis.behavior?.pattern_score ?? 0) > 50 ? 'bg-rose-500' : 'bg-emerald-500'}`}
+                      style={{ width: `${Math.min(latestAnalysis.behavior?.pattern_score ?? 0, 100)}%` }}
                     />
                   </div>
                 </div>
 
                 <div className="text-xs text-slate-500 italic p-2 border-l-2 border-slate-200 bg-slate-50/50">
-                  "{latestAnalysis.behavior.analysis_summary || 'No anomaly detected.'}"
+                  "{latestAnalysis.behavior?.analysis_summary || 'No anomaly detected.'}"
                 </div>
               </div>
             </div>

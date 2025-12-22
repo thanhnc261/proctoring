@@ -41,6 +41,12 @@ function App() {
       },
       onAnalysis: (message: AnalysisMessage) => {
         console.log('📊 Analysis received:', message);
+        console.log('  ├─ Gaze:', message.gaze);
+        console.log('  ├─ Objects:', message.objects);
+        console.log('  ├─ Behavior:', message.behavior);
+        console.log('  ├─ Risk:', message.risk);
+        console.log('  └─ Metadata:', message.metadata);
+
         updateAnalysis({
           gaze: message.gaze,
           objects: message.objects,
@@ -48,6 +54,8 @@ function App() {
           risk: message.risk,
           metadata: message.metadata,
         });
+
+        console.log('✅ Store updated with analysis');
       },
       onError: (error: Error) => {
         console.error('❌ WebSocket error:', error);

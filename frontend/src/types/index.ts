@@ -12,6 +12,9 @@ export interface GazeResults {
   deviation_duration: number;
   landmarks_count: number;
   confidence: number;
+  face_box?: [number, number, number, number];
+  left_eye?: [number, number, number, number];
+  right_eye?: [number, number, number, number];
 }
 
 // Object detection results
