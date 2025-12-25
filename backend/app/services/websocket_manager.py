@@ -4,11 +4,17 @@ WebSocket Connection Manager
 This module manages WebSocket connections for real-time video streaming
 and proctoring communication.
 
-Technology: FastAPI WebSockets with async/await
+Technology: FastAPI WebSockets with async/await + orjson for fast serialization
 """
 
 import json
 from typing import Dict, List, Optional
+
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
 
 from fastapi import WebSocket, WebSocketDisconnect
 from app.utils.json_utils import convert_numpy_types
@@ -68,7 +74,10 @@ class ConnectionManager:
 
     async def send_message(self, session_id: str, message: Dict) -> bool:
         """
-        Send a message to a specific session.
+        Send a message to a specific session with optimized serialization.
+
+        Uses orjson for 2-3x faster JSON serialization if available,
+        falls back to standard json if not.
 
         Args:
             session_id: Target session identifier
@@ -82,11 +91,22 @@ class ConnectionManager:
             return False
 
         try:
-            # Convert NumPy types to Python native types for JSON serialization
-            message = convert_numpy_types(message)
-
             websocket = self.active_connections[session_id]
-            await websocket.send_json(message)
+
+            # Optimization: Use orjson for faster serialization (2-3x speedup)
+            if HAS_ORJSON:
+                # orjson has built-in NumPy support
+                json_bytes = orjson.dumps(
+                    message,
+                    option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+                )
+                json_str = json_bytes.decode('utf-8')
+                await websocket.send_text(json_str)
+            else:
+                # Fallback to standard JSON with manual NumPy conversion
+                message = convert_numpy_types(message)
+                await websocket.send_json(message)
+
             return True
         except WebSocketDisconnect:
             print(f"[WARNING] Connection lost while sending to {session_id}")
@@ -121,7 +141,7 @@ class ConnectionManager:
 
     async def broadcast(self, message: Dict, exclude: Optional[List[str]] = None) -> None:
         """
-        Broadcast a message to all active connections.
+        Broadcast a message to all active connections with optimized serialization.
 
         Args:
             message: Message dictionary to broadcast
@@ -130,15 +150,27 @@ class ConnectionManager:
         exclude = exclude or []
         disconnected = []
 
-        # Convert NumPy types to Python native types for JSON serialization
-        message = convert_numpy_types(message)
+        # Optimization: Serialize once with orjson, reuse for all connections
+        if HAS_ORJSON:
+            json_bytes = orjson.dumps(
+                message,
+                option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+            )
+            json_str = json_bytes.decode('utf-8')
+        else:
+            # Fallback: Convert NumPy types once
+            message = convert_numpy_types(message)
+            json_str = None
 
         for session_id, websocket in self.active_connections.items():
             if session_id in exclude:
                 continue
 
             try:
-                await websocket.send_json(message)
+                if json_str:
+                    await websocket.send_text(json_str)
+                else:
+                    await websocket.send_json(message)
             except WebSocketDisconnect:
                 disconnected.append(session_id)
             except Exception as e:

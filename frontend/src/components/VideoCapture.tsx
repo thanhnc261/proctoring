@@ -10,6 +10,7 @@ import {
   stopMediaStream,
   captureFrame,
   FrameRateCalculator,
+  AdaptiveFrameRateController,
 } from '../utils/videoUtils';
 import type { WebSocketClient } from '../services/websocket';
 import { useProctoringStore } from '../stores/proctoringStore';
@@ -29,12 +30,14 @@ export function VideoCapture({
   const streamRef = useRef<MediaStream | null>(null);
   const intervalRef = useRef<number | null>(null);
   const fpsCalculator = useRef(new FrameRateCalculator());
+  const adaptiveController = useRef(new AdaptiveFrameRateController(targetFPS, 1, 10));
 
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isReady, setIsReady] = useState(false);
   const [currentFPS, setCurrentFPS] = useState(0);
   const [framesSent, setFramesSent] = useState(0);
   const [videoResolution, setVideoResolution] = useState({ width: 0, height: 0 });
+  const [showCanvas, setShowCanvas] = useState(true); // Toggle for canvas visibility
 
   // Initialize camera
   useEffect(() => {
@@ -87,7 +90,7 @@ export function VideoCapture({
     };
   }, []);
 
-  // Handle frame capture and sending
+  // Handle frame capture and sending with adaptive frame rate
   useEffect(() => {
     console.log('📹 VideoCapture state:', {
       isActive,
@@ -106,17 +109,25 @@ export function VideoCapture({
       return;
     }
 
-    // Start capturing frames
-    const intervalMs = 1000 / targetFPS;
-    console.log(`▶️  Starting frame capture at ${targetFPS} FPS (interval: ${intervalMs}ms)`);
+    // Get latest analysis for adaptive control
+    const latestAnalysis = useProctoringStore.getState().latestAnalysis;
 
-    intervalRef.current = window.setInterval(() => {
+    // Start capturing frames with adaptive rate
+    let currentIntervalMs = 1000 / targetFPS;
+    console.log(`▶️  Starting adaptive frame capture (target: ${targetFPS} FPS)`);
+
+    const captureAndSend = () => {
       if (!videoRef.current) {
         console.warn('⚠️ Video ref not available');
         return;
       }
 
-      const frameData = captureFrame(videoRef.current, 0.8);
+      // Get adaptive resolution scale and quality
+      const resolutionScale = adaptiveController.current.getResolutionScale();
+      const quality = resolutionScale < 1.0 ? 0.4 : 0.5; // Lower quality for scaled frames
+
+      // Capture frame with optimized settings
+      const frameData = captureFrame(videoRef.current, quality, resolutionScale);
 
       if (!frameData) {
         console.warn('⚠️ Failed to capture frame');
@@ -129,9 +140,33 @@ export function VideoCapture({
 
         // Update FPS calculation
         fpsCalculator.current.addFrame();
-        setCurrentFPS(Math.round(fpsCalculator.current.getFPS()));
+        const actualFPS = Math.round(fpsCalculator.current.getFPS());
+        setCurrentFPS(actualFPS);
+
+        // Update adaptive controller with processing time
+        const processingTime = latestAnalysis?.metadata?.processing_time_ms || 0;
+        const hasMotion = latestAnalysis?.gaze?.deviation || false;
+
+        const newFPS = adaptiveController.current.updateFrameRate(processingTime, hasMotion);
+
+        // Dynamically adjust interval if FPS changed significantly
+        const newIntervalMs = adaptiveController.current.getInterval();
+        if (Math.abs(newIntervalMs - currentIntervalMs) > 50) {
+          currentIntervalMs = newIntervalMs;
+
+          // Restart interval with new rate
+          if (intervalRef.current !== null) {
+            clearInterval(intervalRef.current);
+          }
+
+          intervalRef.current = window.setInterval(captureAndSend, currentIntervalMs);
+          console.log(`🔄 Adjusted frame rate: ${newFPS} FPS (interval: ${currentIntervalMs}ms)`);
+        }
       }
-    }, intervalMs);
+    };
+
+    // Start initial interval
+    intervalRef.current = window.setInterval(captureAndSend, currentIntervalMs);
 
     return () => {
       if (intervalRef.current !== null) {
@@ -147,6 +182,7 @@ export function VideoCapture({
       setFramesSent(0);
       setCurrentFPS(0);
       fpsCalculator.current.reset();
+      adaptiveController.current.reset();
       // Reset smoothed boxes
       smoothedFaceBox.current = null;
       smoothedLeftEye.current = null;
@@ -187,8 +223,8 @@ export function VideoCapture({
       cancelAnimationFrame(animationFrameRef.current);
     }
 
-    // Helper to smoothly interpolate bounding boxes (70% old + 30% new = faster tracking)
-    // If movement is too large (>15% of frame), render new position directly
+    // Helper to smoothly interpolate bounding boxes with adaptive responsiveness
+    // Uses velocity-based smoothing: faster movement = less smoothing
     const smoothBox = (
       current: [number, number, number, number] | null,
       target: [number, number, number, number]
@@ -198,24 +234,44 @@ export function VideoCapture({
       // Calculate distance moved (normalized)
       const dx = Math.abs(target[0] - current[0]);
       const dy = Math.abs(target[1] - current[1]);
-      const maxMovement = Math.max(dx, dy);
+      const dw = Math.abs(target[2] - current[2]);
+      const dh = Math.abs(target[3] - current[3]);
+      const maxMovement = Math.max(dx, dy, dw, dh);
 
-      // If movement is too large (quick head turn), jump to new position
-      if (maxMovement > 0.15) {
-        return target;
+      // Adaptive smoothing factor based on velocity
+      // Fast movement (>8%): 20% smoothing (80% new position)
+      // Medium movement (3-8%): 40% smoothing (60% new position)
+      // Slow movement (<3%): 60% smoothing (40% new position)
+      let smoothFactor: number;
+      if (maxMovement > 0.08) {
+        // Fast movement - respond quickly
+        smoothFactor = 0.2;
+      } else if (maxMovement > 0.03) {
+        // Medium movement - balanced smoothing
+        smoothFactor = 0.4;
+      } else {
+        // Slow/micro movement - heavy smoothing to reduce jitter
+        smoothFactor = 0.6;
       }
 
-      // Otherwise, smooth interpolation for natural movement
+      // Apply adaptive interpolation
+      const alpha = 1 - smoothFactor; // Inverse for new position weight
       return [
-        current[0] * 0.7 + target[0] * 0.3, // x - faster tracking
-        current[1] * 0.7 + target[1] * 0.3, // y - faster tracking
-        current[2] * 0.7 + target[2] * 0.3, // w - faster resizing
-        current[3] * 0.7 + target[3] * 0.3, // h - faster resizing
+        current[0] * smoothFactor + target[0] * alpha, // x
+        current[1] * smoothFactor + target[1] * alpha, // y
+        current[2] * smoothFactor + target[2] * alpha, // w
+        current[3] * smoothFactor + target[3] * alpha, // h
       ];
     };
 
     // Use requestAnimationFrame for smooth rendering (throttles to ~60fps max)
     animationFrameRef.current = requestAnimationFrame(() => {
+      // Skip rendering if canvas is hidden
+      if (!showCanvas) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        return;
+      }
+
       // Match canvas resolution to video
       if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
         canvas.width = video.videoWidth;
@@ -317,7 +373,7 @@ export function VideoCapture({
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [latestAnalysis, isActive]);
+  }, [latestAnalysis, isActive, showCanvas]);
 
   if (cameraError) {
     return (
@@ -340,6 +396,19 @@ export function VideoCapture({
           </h3>
         </div>
         <div className="flex items-center gap-2 text-xs font-bold">
+          {/* Canvas Overlay Toggle */}
+          <button
+            onClick={() => setShowCanvas(!showCanvas)}
+            className={`px-2 py-1 rounded-md border transition-all ${
+              showCanvas
+                ? 'bg-blue-100 text-blue-700 border-blue-200 hover:bg-blue-200'
+                : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'
+            }`}
+            title={showCanvas ? 'Hide detection overlay' : 'Show detection overlay'}
+          >
+            {showCanvas ? '👁️ OVERLAY' : '👁️‍🗨️ OVERLAY'}
+          </button>
+
           <div className="px-2 py-1 rounded-md bg-white/50 border border-white/60 text-slate-600">
             {targetFPS} FPS TARGET
           </div>

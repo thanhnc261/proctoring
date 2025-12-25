@@ -34,8 +34,8 @@ def initialize_pipeline():
         print("[INIT] Initializing detection pipeline...")
         # Disable preprocessing temporarily to diagnose detection issues
         pipeline = DetectionPipeline(
-            enable_preprocessing=False,
-            enable_roi=False,
+            enable_preprocessing=True,
+            enable_roi=True,
             enable_adaptive_sampling=True
         )
         print("[SUCCESS] Detection pipeline ready (preprocessing disabled for debugging)")

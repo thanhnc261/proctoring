@@ -154,23 +154,26 @@ class DetectionPipeline:
             preprocess_start = time.time()
 
             # Phase 1 Optimization: Image Preprocessing
-            # Apply CLAHE and bilateral filtering for better detection
+            # Apply CLAHE and bilateral filtering for better gaze detection
             if self.enable_preprocessing:
                 processed_frame = self.preprocessor.preprocess(frame)
             else:
                 processed_frame = frame
 
             # Phase 1 Optimization: ROI Extraction (optional)
-            # Extract region of interest for focused processing
+            # Extract region of interest for focused gaze processing
+            # ROI is only used for gaze detection (face is typically in upper frame)
             roi_frame, roi_info = self.roi_extractor.extract_roi(processed_frame)
 
             preprocess_time = time.time() - preprocess_start
             self._preprocessing_times.append(preprocess_time)
 
             # Run all detectors concurrently for maximum performance
-            # Use ROI frame for detection
+            # IMPORTANT: Use different frames for different detectors:
+            # - Gaze: Use preprocessed + ROI frame (face detection benefits from CLAHE + focus)
+            # - Objects: Use original full frame (YOLO needs full frame + was trained on normal images)
             gaze_task = self.gaze_detector.detect(roi_frame)
-            object_task = self.object_detector.detect(roi_frame)
+            object_task = self.object_detector.detect(frame)  # Use ORIGINAL frame for object detection
 
             # Execute both tasks concurrently
             gaze_results, object_results = await asyncio.gather(
@@ -185,6 +188,10 @@ class DetectionPipeline:
             if isinstance(object_results, Exception):
                 print(f"[WARNING] Object detection error: {object_results}")
                 object_results = self._get_default_object_results()
+
+            # Transform gaze coordinates from ROI space to original frame space
+            if roi_info.get("enabled", False) and gaze_results.get("face_detected", False):
+                gaze_results = self._transform_gaze_coordinates(gaze_results, roi_info)
 
             # Prepare detection results for behavior analyzer
             detection_results = {
@@ -430,6 +437,61 @@ class DetectionPipeline:
                 },
             },
         }
+
+    def _transform_gaze_coordinates(self, gaze_results: Dict, roi_info: Dict) -> Dict:
+        """
+        Transform gaze coordinates from ROI space to original frame space.
+
+        When ROI extraction is enabled, the gaze detector processes only the top portion
+        of the frame (e.g., top 70%). The coordinates (face_box, left_eye, right_eye) are
+        normalized relative to the ROI frame. This method transforms them back to be
+        relative to the original full frame.
+
+        Args:
+            gaze_results: Gaze detection results with ROI-relative coordinates
+            roi_info: ROI metadata containing reduction_ratio
+
+        Returns:
+            Transformed gaze results with original frame coordinates
+        """
+        if not roi_info.get("enabled", False):
+            return gaze_results
+
+        # Get ROI reduction ratio (e.g., 0.7 for top 70%)
+        roi_ratio = roi_info.get("reduction_ratio", 1.0)
+
+        # Transform face_box if present
+        if "face_box" in gaze_results and gaze_results["face_box"] is not None:
+            x, y, w, h = gaze_results["face_box"]
+            # Scale y and height to account for ROI
+            gaze_results["face_box"] = (
+                x,                    # x unchanged (full width used)
+                y * roi_ratio,        # scale y position
+                w,                    # width unchanged (full width used)
+                h * roi_ratio,        # scale height
+            )
+
+        # Transform left_eye if present
+        if "left_eye" in gaze_results and gaze_results["left_eye"] is not None:
+            x, y, w, h = gaze_results["left_eye"]
+            gaze_results["left_eye"] = (
+                x,
+                y * roi_ratio,
+                w,
+                h * roi_ratio,
+            )
+
+        # Transform right_eye if present
+        if "right_eye" in gaze_results and gaze_results["right_eye"] is not None:
+            x, y, w, h = gaze_results["right_eye"]
+            gaze_results["right_eye"] = (
+                x,
+                y * roi_ratio,
+                w,
+                h * roi_ratio,
+            )
+
+        return gaze_results
 
     def _get_default_gaze_results(self) -> Dict:
         """
